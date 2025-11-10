@@ -4,7 +4,7 @@
 #include "ncbind.hpp"
 #include <map>
 
-#define BASENAME L"mem"
+#define BASENAME TJS_W("mem")
 
 /**
  * ファイル情報保持用クラス
@@ -88,9 +88,9 @@ public:
 			tTJSVariant name(this->name);
 			tTJSVariant size((tjs_int64)getSize());
 			tTJSVariant isDirectory(isDirectory() ? 1 : 0);
-			dict->PropSet(TJS_MEMBERENSURE, L"name",  NULL, &name, dict);
-			dict->PropSet(TJS_MEMBERENSURE, L"size",  NULL, &size, dict);
-			dict->PropSet(TJS_MEMBERENSURE, L"isDirectory",  NULL, &isDirectory, dict);
+			dict->PropSet(TJS_MEMBERENSURE, TJS_W("name"),  NULL, &name, dict);
+			dict->PropSet(TJS_MEMBERENSURE, TJS_W("size"),  NULL, &size, dict);
+			dict->PropSet(TJS_MEMBERENSURE, TJS_W("isDirectory"),  NULL, &isDirectory, dict);
 			tTJSVariant ret(dict, dict);
 			dict->Release();
 			return ret;
@@ -153,7 +153,7 @@ public:
 		if (pDirectory) {
 			const tjs_char *p = name.c_str();
 			const tjs_char *q;
-			if ((q = wcschr(p, '/'))) {
+			if ((q = TJS_strchr(p, '/'))) {
 				if (q == p) {
 					return NULL;
 				}
@@ -218,7 +218,7 @@ public:
 		if (pDirectory && name != "" && name.GetLastChar() != '/') {
 			const tjs_char *p = name.c_str();
 			const tjs_char *q;
-			if ((q = wcschr(p, '/'))) {
+			if ((q = TJS_strchr(p, '/'))) {
 				if (q == p) {
 					return NULL;
 				}
@@ -243,7 +243,7 @@ public:
 		if (pDirectory && name != "") {
 			const tjs_char *p = name.c_str();
 			const tjs_char *q;
-			if ((q = wcschr(p, '/'))) {
+			if ((q = TJS_strchr(p, '/'))) {
 				if (q == p) {
 					return NULL;
 				}
@@ -437,10 +437,10 @@ public:
 	void getFilename(const ttstr &name, ttstr &dname, ttstr &fname) {
 		const tjs_char *p = name.c_str();
 		const tjs_char *q;
-		if ((q = wcschr(p, '/'))) {
+		if ((q = TJS_strchr(p, '/'))) {
 			dname = ttstr(p, q-p);
 			fname = ttstr(q+1);
-			if (dname != L".") {
+			if (dname != TJS_W(".")) {
 				TVPThrowExceptionMessage(TJS_W("no such domain:%1"), dname);
 			}
 		} else {
