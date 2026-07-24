@@ -1,10 +1,64 @@
 #include <stdio.h>
 #include <string.h>
-#include <windows.h>
 #include "ncbind.hpp"
 #include <map>
+#include <vector>
 
 #define BASENAME TJS_W("mem")
+
+/**
+ * 移植可能なメモリ上バイナリストリーム
+ *   旧実装は HGLOBAL + CreateStreamOnHGlobal(IStream) + LARGE_INTEGER という
+ *   Windows/COM 依存だったため、NX/PS5 等ではビルドできなかった。
+ *   FileInfo が保持する可変長バッファ (std::vector) を参照して読み書き/シーク
+ *   する自己完結実装に置き換え、windows.h 依存を排除する。
+ *   ストリームはバッファ本体 (vector) への参照のみ保持し、書き込み時の再確保
+ *   でも毎回添字アクセスするため問題ない。ストリーム破棄後もバッファは
+ *   FileInfo 側に残る (旧 CreateStreamOnHGlobal(fDeleteOnRelease=FALSE) と同じ)。
+ */
+class MemFileStream : public iTJSBinaryStream {
+	std::vector<unsigned char> &buf;
+	tjs_uint64 pos;
+public:
+	MemFileStream(std::vector<unsigned char> &b, bool append)
+		: buf(b), pos(append ? (tjs_uint64)b.size() : 0) {}
+	virtual ~MemFileStream() {}
+
+	tjs_uint64 TJS_INTF_METHOD Seek(tjs_int64 offset, tjs_int whence) {
+		tjs_int64 np;
+		switch (whence) {
+		case TJS_BS_SEEK_SET: np = offset;                          break;
+		case TJS_BS_SEEK_CUR: np = (tjs_int64)pos + offset;         break;
+		case TJS_BS_SEEK_END: np = (tjs_int64)buf.size() + offset;  break;
+		default:              np = (tjs_int64)pos;                  break;
+		}
+		if (np < 0) np = 0;
+		pos = (tjs_uint64)np;
+		return pos;
+	}
+	tjs_uint TJS_INTF_METHOD Read(void *buffer, tjs_uint read_size) {
+		if (pos >= (tjs_uint64)buf.size()) return 0;
+		tjs_uint64 avail = (tjs_uint64)buf.size() - pos;
+		tjs_uint n = (read_size < avail) ? read_size : (tjs_uint)avail;
+		if (n) memcpy(buffer, &buf[(size_t)pos], n);
+		pos += n;
+		return n;
+	}
+	tjs_uint TJS_INTF_METHOD Write(const void *buffer, tjs_uint write_size) {
+		if (write_size == 0) return 0;
+		tjs_uint64 end = pos + write_size;
+		if (end > (tjs_uint64)buf.size()) buf.resize((size_t)end); // 隙間はゼロ埋め
+		memcpy(&buf[(size_t)pos], buffer, write_size);
+		pos += write_size;
+		return write_size;
+	}
+	void TJS_INTF_METHOD SetEndOfStorage() {
+		buf.resize((size_t)pos);
+	}
+	tjs_uint64 TJS_INTF_METHOD GetSize() {
+		return (tjs_uint64)buf.size();
+	}
+};
 
 /**
  * ファイル情報保持用クラス
@@ -20,7 +74,7 @@ public:
 	 * @param name 名前
 	 * @param directory ディレクトリなら true
 	 */
-	FileInfo(FileInfo *pParent, const ttstr &name, bool directory=false) : pParent(pParent), name(name), hBuffer(0), pDirectory(0) {
+	FileInfo(FileInfo *pParent, const ttstr &name, bool directory=false) : pParent(pParent), name(name), pBuffer(0), pDirectory(0) {
 		if (directory) {
 			pDirectory = new Directory();
 		}
@@ -38,9 +92,9 @@ public:
 			}
 			delete pDirectory;
 		}
-		if (hBuffer) {
-			::GlobalFree(hBuffer);
-			hBuffer = 0;
+		if (pBuffer) {
+			delete pBuffer;
+			pBuffer = 0;
 		}
 	}
 
@@ -61,12 +115,8 @@ public:
 	 */
 	tTJSVariant getData() const {
 		tTJSVariant ret;
-		if (hBuffer) {
-			unsigned char* pBuffer = (unsigned char*)::GlobalLock(hBuffer);
-			if (pBuffer) {
-				ret = tTJSVariant(pBuffer, GlobalSize(hBuffer));
-				::GlobalUnlock(hBuffer);
-			}
+		if (pBuffer && !pBuffer->empty()) {
+			ret = tTJSVariant((const tjs_uint8*)&(*pBuffer)[0], (tjs_uint)pBuffer->size());
 		}
 		return ret;
 	}
@@ -74,8 +124,8 @@ public:
 	/**
 	 * @return ファイルサイズ
 	 */
-	DWORD getSize() const {
-		return hBuffer ? GlobalSize(hBuffer) : 0;
+	tjs_uint getSize() const {
+		return pBuffer ? (tjs_uint)pBuffer->size() : 0;
 	}
 	
 	/**
@@ -302,17 +352,14 @@ protected:
 	
 	/**
 	 * @return ファイルストリームを返す
+	 * @param append 末尾追記モード (現在位置を末尾に置く)
 	 */
-	IStream *getStream() {
+	iTJSBinaryStream *getStream(bool append) {
 		if (!pDirectory) {
-			if (hBuffer == 0) {
-				hBuffer = ::GlobalAlloc(GMEM_MOVEABLE, 0);
+			if (pBuffer == 0) {
+				pBuffer = new std::vector<unsigned char>();
 			}
-			if (hBuffer) {
-				IStream *pStream;
-				::CreateStreamOnHGlobal(hBuffer, FALSE, &pStream);
-				return pStream;
-			}
+			return new MemFileStream(*pBuffer, append);
 		}
 		return NULL;
 	}
@@ -329,28 +376,18 @@ protected:
 	 */
 	iTJSBinaryStream *_open(const ttstr &name, tjs_uint32 flags) {
 		if (pDirectory) {
-			IStream *stream = NULL;
+			bool append = (flags == TJS_BS_APPEND);
 			Directory::const_iterator it = pDirectory->find(name);
 			if (it != pDirectory->end()) {
-				stream = it->second->getStream();
+				return it->second->getStream(append);
 			} else {
 				if (flags == TJS_BS_WRITE) {
 					FileInfo *file = new FileInfo(this, name);
 					if (file) {
 						(*pDirectory)[name] = file;
-						stream = file->getStream();
+						return file->getStream(false);
 					}
 				}
-			}
-			if (stream) {
-				if (flags == TJS_BS_APPEND) {
-					LARGE_INTEGER n;
-					n.QuadPart = 0;
-					stream->Seek(n, STREAM_SEEK_END, NULL);
-				}
-				iTJSBinaryStream *bstream =TVPCreateBinaryStreamAdapter(stream);
-				stream->Release();
-				return bstream;
 			}
 		}
 		return NULL;
@@ -392,7 +429,7 @@ protected:
 private:
     FileInfo *pParent;
     ttstr name;
-	HGLOBAL hBuffer;
+	std::vector<unsigned char> *pBuffer;
 	Directory *pDirectory;
 };
 
